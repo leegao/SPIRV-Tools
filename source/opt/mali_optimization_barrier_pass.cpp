@@ -38,6 +38,8 @@ namespace opt {
 
 Pass::Status MaliOptimizationBarrierPass::Process() {
   bool modified = false;
+  auto scalar_modifications = 0u;
+  auto vector_modifications = 0u;
 
   // Iterate over all functions in the module.
   for (auto& func : *context()->module()) {
@@ -101,12 +103,19 @@ Pass::Status MaliOptimizationBarrierPass::Process() {
                                      {SPV_OPERAND_TYPE_ID, {const_0_id}}});
         builder.AddInstruction(std::move(noop_barrier_inst));
         modified = true;
+        if (is_scalar) {
+          scalar_modifications += 1;
+        } else {
+          vector_modifications += 1;
+        }
       }
     }
   }
 
   if (modified) {
-    LOGD("Added optimization barriers to all functions in the module");
+    LOG("Added optimization barriers to all functions in the module, "
+        "scalar barriers = %d, vector barriers = %d",
+        scalar_modifications, vector_modifications);
   }
   return modified ? Status::SuccessWithChange : Status::SuccessWithoutChange;
 }
