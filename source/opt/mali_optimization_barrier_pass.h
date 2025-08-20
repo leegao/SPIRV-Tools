@@ -12,29 +12,34 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef SOURCE_OPT_FIX_MALI_SPEC_CONSTANT_COMPOSITE_PASS_H_
-#define SOURCE_OPT_FIX_MALI_SPEC_CONSTANT_COMPOSITE_PASS_H_
+#ifndef SOURCE_OPT_MALI_OPTIMIZATION_BARRIER_PASS_H_
+#define SOURCE_OPT_MALI_OPTIMIZATION_BARRIER_PASS_H_
 
 #include "source/opt/ir_context.h"
 #include "source/opt/mem_pass.h"
-#include "source/opt/module.h"
 #include "source/opt/pass.h"
 
 namespace spvtools {
 namespace opt {
 
 // See optimizer.hpp for documentation.
-class FixMaliSpecConstantCompositePass : public MemPass {
- public:
-  const char* name() const override { return "fix-mali-spec-constant-composite"; }
-  Status Process() override;
+class MaliOptimizationBarrierPass : public MemPass {
+public:
+    MaliOptimizationBarrierPass() = default;
+    const char* name() const override { return "mali-optimization-barrier"; }
+    Status Process() override;
 
-  IRContext::Analysis GetPreservedAnalyses() override {
-    return IRContext::kAnalysisNone;
-  }
+    IRContext::Analysis GetPreservedAnalyses() override {
+        return IRContext::kAnalysisNone;
+    }
+
+private:
+    // Helper function to get or create the ID for a constant 0
+    uint32_t GetOrCreateConstantZero(uint32_t type_id) const;
+    uint32_t GetOrCreateConstantZeroVector(uint32_t type_id) const;
 };
 
-}  // namespace opt
-}  // namespace spvtools
+} // namespace opt
+} // namespace spvtools
 
-#endif  // SOURCE_OPT_FIX_MALI_SPEC_CONSTANT_COMPOSITE_PASS_H_
+#endif // SOURCE_OPT_MALI_OPTIMIZATION_BARRIER_PASS_H_

@@ -157,6 +157,7 @@ SPVTOOLS_OPT_SRC_FILES := \
 		source/opt/loop_unroller.cpp \
 		source/opt/loop_unswitch_pass.cpp \
 		source/opt/loop_utils.cpp \
+		source/opt/mali_optimization_barrier_pass.cpp \
 		source/opt/mem_pass.cpp \
 		source/opt/merge_return_pass.cpp \
 		source/opt/modify_maximal_reconvergence.cpp \

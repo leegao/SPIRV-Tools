@@ -647,6 +647,8 @@ bool Optimizer::RegisterPassFromFlag(const std::string& flag,
     RegisterPass(CreateRemoveClipCullDistPass());
   } else if (pass_name == "fix-mali-spec-constant-composite") {
     RegisterPass(CreateFixMaliSpecConstantCompositePass());
+  } else if (pass_name == "mali-optimization-barrier") {
+    RegisterPass(CreateMaliOptimizationBarrierPass());
   } else {
     Errorf(consumer(), nullptr, {},
            "Unknown flag '--%s'. Use --help for a list of valid flags",
@@ -1221,6 +1223,11 @@ Optimizer::PassToken CreateRemoveClipCullDistPass() {
 Optimizer::PassToken CreateFixMaliSpecConstantCompositePass() {
   return MakeUnique<Optimizer::PassToken::Impl>(
       MakeUnique<opt::FixMaliSpecConstantCompositePass>());
+}
+
+Optimizer::PassToken CreateMaliOptimizationBarrierPass() {
+  return MakeUnique<Optimizer::PassToken::Impl>(
+      MakeUnique<opt::MaliOptimizationBarrierPass>());
 }
 
 }  // namespace spvtools
