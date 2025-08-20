@@ -36,6 +36,7 @@ public:
 private:
     // Helper function to get or create the ID for a constant 0
     uint32_t GetOrCreateConstantZero(uint32_t type_id) const;
+    uint32_t GetOrCreateConstantZeroVector(uint32_t type_id) const;
 };
 
 } // namespace opt

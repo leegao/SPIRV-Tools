@@ -14,23 +14,24 @@
 
 #include "mali_optimization_barrier_pass.h"
 
-#include "source/opt/ir_builder.h"
 #include <algorithm>
 #include <memory>
 #include <string>
 #include <vector>
 
+#include "source/opt/ir_builder.h"
+
 #define LOG_(level, fmt, ...)                                         \
   do {                                                                \
     char buffer[256];                                                 \
     snprintf(buffer, sizeof(buffer), "OptimizationBarrierPass: " fmt, \
-             ## __VA_ARGS__);                                          \
+             ##__VA_ARGS__);                                          \
     consumer()(level, __FUNCTION__, {__LINE__, 0, 0}, buffer);        \
   } while (0)
 
-#define LOGD(fmt, ...) LOG_(SPV_MSG_DEBUG, fmt, ## __VA_ARGS__)
-#define LOG(fmt, ...) LOG_(SPV_MSG_INFO, fmt, ## __VA_ARGS__)
-#define LOGE(fmt, ...) LOG_(SPV_MSG_ERROR, fmt, ## __VA_ARGS__)
+#define LOGD(fmt, ...) LOG_(SPV_MSG_DEBUG, fmt, ##__VA_ARGS__)
+#define LOG(fmt, ...) LOG_(SPV_MSG_INFO, fmt, ##__VA_ARGS__)
+#define LOGE(fmt, ...) LOG_(SPV_MSG_ERROR, fmt, ##__VA_ARGS__)
 
 namespace spvtools {
 namespace opt {
@@ -56,12 +57,23 @@ Pass::Status MaliOptimizationBarrierPass::Process() {
                 shift_amount_id);
 
         // If the shift is a constant (may trigger constant folding bug)
-        // TODO: generalize to ivecs and uvecs as well
-        if (!shift_constant || !shift_constant->type()->AsInteger()) continue;
+        if (!shift_constant) continue;
+        const bool is_scalar = shift_constant->type()->AsInteger();
+        const bool is_vector =
+            shift_constant->type()->AsVector() &&
+            shift_constant->type()->AsVector()->element_type()->AsInteger();
+
+        // LOG("%s, shift_constant=%s, scalar=%d, vector=%d",
+        //   inst->PrettyPrint().c_str(),
+        //   shift_constant->type()->str().c_str(), is_scalar, is_vector);
+
+        if (!is_scalar && !is_vector) continue;
 
         uint32_t original_result_type_id = inst->type_id();
         uint32_t original_result_id = inst->result_id();
-        uint32_t const_0_id = GetOrCreateConstantZero(original_result_type_id);
+        uint32_t const_0_id =
+            is_scalar ? GetOrCreateConstantZero(original_result_type_id)
+                      : GetOrCreateConstantZeroVector(original_result_type_id);
         if (const_0_id == 0) {
           LOGE("Failed to get or create %%int_0 or %%uint_9");
           return Status::Failure;
@@ -80,17 +92,13 @@ Pass::Status MaliOptimizationBarrierPass::Process() {
         // folding optimizations that may be broken on some drivers
         // %original_result_id = OpBitFieldInsert %type %temp_result_id 0 0 0
         InstructionBuilder builder(context(), inst->NextNode());
-        auto noop_barrier_inst =
-            std::make_unique<Instruction>(
-                context(),
-                spv::Op::OpBitFieldInsert,
-                original_result_type_id,
-                original_result_id,
-                Instruction::OperandList{
-                    {SPV_OPERAND_TYPE_ID, {temp_result_id}},
-                    {SPV_OPERAND_TYPE_ID, {const_0_id}},
-                    {SPV_OPERAND_TYPE_ID, {const_0_id}},
-                    {SPV_OPERAND_TYPE_ID, {const_0_id}}});
+        auto noop_barrier_inst = std::make_unique<Instruction>(
+            context(), spv::Op::OpBitFieldInsert, original_result_type_id,
+            original_result_id,
+            Instruction::OperandList{{SPV_OPERAND_TYPE_ID, {temp_result_id}},
+                                     {SPV_OPERAND_TYPE_ID, {const_0_id}},
+                                     {SPV_OPERAND_TYPE_ID, {const_0_id}},
+                                     {SPV_OPERAND_TYPE_ID, {const_0_id}}});
         builder.AddInstruction(std::move(noop_barrier_inst));
         modified = true;
       }
@@ -107,7 +115,7 @@ uint32_t MaliOptimizationBarrierPass::GetOrCreateConstantZero(
     const uint32_t type_id) const {
   analysis::Type* type = context()->get_type_mgr()->GetType(type_id);
   if (!type) return 0;
-  const analysis::Integer* int_type = type->AsInteger();
+  const auto* int_type = type->AsInteger();
   if (!int_type) {
     return 0;
   }
@@ -115,6 +123,45 @@ uint32_t MaliOptimizationBarrierPass::GetOrCreateConstantZero(
     return context()->get_constant_mgr()->GetSIntConstId(0);
   }
   return context()->get_constant_mgr()->GetUIntConstId(0);
+}
+
+uint32_t MaliOptimizationBarrierPass::GetOrCreateConstantZeroVector(
+    const uint32_t type_id) const {
+  analysis::TypeManager* type_mgr = context()->get_type_mgr();
+  analysis::ConstantManager* const_mgr = context()->get_constant_mgr();
+
+  analysis::Type* type = type_mgr->GetType(type_id);
+  if (!type) {
+    return 0;
+  }
+
+  const auto* vec_type = type->AsVector();
+  if (!vec_type) {
+    return 0;
+  }
+
+  const auto* int_type = vec_type->element_type()->AsInteger();
+  if (!int_type) {
+    return 0;
+  }
+
+  std::vector<uint32_t> component_ids;
+  for (auto i = 0u; i < vec_type->element_count(); i++) {
+    if (int_type->IsSigned()) {
+      component_ids.push_back(const_mgr->GetSIntConstId(0));
+    } else {
+      component_ids.push_back(const_mgr->GetUIntConstId(0));
+    }
+  }
+
+  const uint32_t vec_type_id = type_mgr->GetTypeInstruction(vec_type);
+  if (!vec_type_id) {
+    return 0;
+  }
+  const analysis::Constant* uvec_const =
+      const_mgr->GetConstant(type_mgr->GetType(vec_type_id), component_ids);
+  return uvec_const ? const_mgr->GetDefiningInstruction(uvec_const)->result_id()
+                    : 0;
 }
 
 }  // namespace opt
