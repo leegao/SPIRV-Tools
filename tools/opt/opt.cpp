@@ -595,6 +595,10 @@ Options (in lexicographical order):)",
                MALI-only.
                )");
   printf(R"(
+  --mali-optimization-barrier
+               MALI-only.
+               )");
+  printf(R"(
   --unify-const
                Remove the duplicated constants.)");
   printf(R"(

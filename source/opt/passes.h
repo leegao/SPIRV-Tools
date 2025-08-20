@@ -62,6 +62,7 @@
 #include "source/opt/loop_peeling.h"
 #include "source/opt/loop_unroller.h"
 #include "source/opt/loop_unswitch_pass.h"
+#include "source/opt/mali_optimization_barrier_pass.h"
 #include "source/opt/merge_return_pass.h"
 #include "source/opt/modify_maximal_reconvergence.h"
 #include "source/opt/null_pass.h"
