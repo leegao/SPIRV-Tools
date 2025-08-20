@@ -81,6 +81,10 @@ Pass::Status MaliOptimizationBarrierPass::Process() {
           return Status::Failure;
         }
 
+        // uint 0's for the OpBitFieldInsert operands
+        uint32_t const_0_uint_id =
+            context()->get_constant_mgr()->GetUIntConstId(0);
+
         // Allocate a temp result id for the shift
         uint32_t temp_result_id = context()->TakeNextId();
         if (temp_result_id == 0) {
@@ -97,10 +101,11 @@ Pass::Status MaliOptimizationBarrierPass::Process() {
         auto noop_barrier_inst = std::make_unique<Instruction>(
             context(), spv::Op::OpBitFieldInsert, original_result_type_id,
             original_result_id,
-            Instruction::OperandList{{SPV_OPERAND_TYPE_ID, {temp_result_id}},
-                                     {SPV_OPERAND_TYPE_ID, {const_0_id}},
-                                     {SPV_OPERAND_TYPE_ID, {const_0_id}},
-                                     {SPV_OPERAND_TYPE_ID, {const_0_id}}});
+            Instruction::OperandList{
+                {SPV_OPERAND_TYPE_ID, {temp_result_id}},     // base
+                {SPV_OPERAND_TYPE_ID, {const_0_id}},         // insert
+                {SPV_OPERAND_TYPE_ID, {const_0_uint_id}},    // offset
+                {SPV_OPERAND_TYPE_ID, {const_0_uint_id}}});  // count
         builder.AddInstruction(std::move(noop_barrier_inst));
         modified = true;
         if (is_scalar) {
