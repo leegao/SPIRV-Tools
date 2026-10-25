@@ -75,6 +75,7 @@ add_spvtools_unittest(TARGET opt
        local_single_block_elim.cpp
        local_single_store_elim_test.cpp
        local_ssa_elim_test.cpp
+       mali_passes_test.cpp
        modify_maximal_reconvergence_test.cpp
        module_test.cpp
        module_utils.h
