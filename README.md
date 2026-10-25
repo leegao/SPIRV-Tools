@@ -1,6 +1,429 @@
 # SPIR-V Tools
 [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/KhronosGroup/SPIRV-Tools/badge)](https://securityscorecards.dev/viewer/?uri=github.com/KhronosGroup/SPIRV-Tools)
 
+Note: MaliBitwiseScalarPass, MaliClampZeroPass, MaliPerVertexBlockPass, and MaliLockstepPass are adapted from https://github.com/ASEbrahim/MaliBridge
+
+| Pass                               | Optimizer flag                       | C++ factory                                |
+| ---------------------------------- | ------------------------------------ | ------------------------------------------ |
+| `FixMaliSpecConstantCompositePass` | `--fix-mali-spec-constant-composite` | `CreateFixMaliSpecConstantCompositePass()` |
+| `MaliOptimizationBarrierPass`      | `--mali-optimization-barrier`        | `CreateMaliOptimizationBarrierPass()`      |
+| `MaliBitwiseScalarPass`            | `--mali-bitwise-scalar`              | `CreateMaliBitwiseScalarPass(bool)`        |
+| `MaliClampZeroPass`                | `--mali-clamp-zero`                  | `CreateMaliClampZeroPass(bool, bool)`      |
+| `MaliPerVertexBlockPass`           | `--mali-pervertex-block`             | `CreateMaliPerVertexBlockPass()`           |
+| `MaliLockstepPass`                 | `--mali-lockstep`                    | `CreateMaliLockstepPass()`                 |
+| `LowerClipCullDistancePass`        | `--remove-clip-cull-dist`            | `CreateRemoveClipCullDistPass()`           |
+
+
+Should be run them in this order:
+spec-constant fix, per-vertex block, shift barrier, bitwise scalar,
+clamp zero, lockstep, clip/cull distance.
+
+The per-vertex pass goes first
+because it changes the interface, and the spec-constant fix goes first because
+the other passes inspect constant instructions.
+
+---
+
+## FixMaliSpecConstantCompositePass
+
+### Problem
+
+Some Mali drivers mis-compile a boolean vector that is declared as an
+`OpConstantComposite` whose constituents are specialization constants (for
+example the `gl_SampleMask`-style `%v4bool` built by glslang). The vector is
+treated as a plain constant instead of a specialization-dependent value.
+
+### Transformation
+
+For every `OpConstantComposite` instruction:
+
+1. The result type must be `OpTypeVector` of `OpTypeBool`.
+2. At least one constituent must be a specialization constant
+   (`OpSpecConstant`, `OpSpecConstantTrue`, `OpSpecConstantFalse`,
+   `OpSpecConstantComposite`, or `OpSpecConstantOp`).
+3. The instruction's opcode is changed to `OpSpecConstantComposite`.
+
+The operands and result id are unchanged, so every use remains valid and the
+value becomes specialization-dependent exactly as intended.
+
+### Preconditions and limits
+
+- Requires the `Shader` capability.
+- Only boolean vectors are handled. Arrays and structs whose constituents are
+  specialization constants are left alone; turning those into specialization
+  constants is not required for the Mali bug and would change more of the
+  module.
+- Non-boolean vectors (for example integer vectors) are left alone.
+
+### Design notes
+
+The pass uses `Module::GetConstants()` and a read-only def-use lookup. It does
+not need to rebuild def-use information because it only changes opcodes, not
+operands or definitions.
+
+---
+
+## MaliOptimizationBarrierPass
+
+### Problem
+
+The Mali compiler may constant-fold a left shift whose shift amount is a
+compile-time constant into an incorrect value. The generated code must keep the
+shift opaque to the driver's constant folder.
+
+### Transformation
+
+For every `OpShiftLeftLogical` in a function body:
+
+1. The shift amount must resolve to a declared constant
+   (`analysis::ConstantManager::FindDeclaredConstant`). A scalar integer or a
+   vector of integers is accepted.
+2. The original shift is cloned and the clone is given a fresh result id.
+   The clone is inserted immediately before the original instruction.
+3. The original instruction is rewritten in place as
+
+    ```text
+    %original = OpBitFieldInsert %type %clone %zero %zero32 %zero32
+    ```
+
+    where `%zero` is a zero constant of the shift's _result_ type (a zero vector
+    for vector results) and `%zero32` is an unsigned 32-bit zero used for the
+    offset and count. Inserting zero bits at offset zero is a semantic no-op,
+    but the instruction is not a foldable shift. The shape of `%zero` is taken
+    from the result type, not from the shift amount.
+
+Keeping the original result id on the barrier means every existing use stays
+valid without a rename, and the cloned shift remains available to the barrier.
+
+### Preconditions and limits
+
+- Only `OpShiftLeftLogical` is handled. Other shift directions are not part of
+  the observed Mali bug.
+- The shift amount must be a declared constant; a value loaded at run time is
+  left alone.
+- The zero constant is created with the exact result type and width, including
+  16/32/64-bit integers and vectors. `ConstantManager::GetUIntConstId` and
+  `GetSIntConstId` are avoided because they always produce 32-bit constants.
+- `OpBitFieldInsert` requires `Insert` to have the same type as the result and
+  `Offset`/`Count` to be integer scalars; the pass builds exactly that shape.
+
+### Design notes
+
+The pass updates def-use information with `IRContext::UpdateDefUse` after both
+the clone and the rewrite. The clone is inserted before the original
+instruction, which keeps the module valid at every intermediate step (the
+original result id always has a definition).
+
+---
+
+## MaliBitwiseScalarPass
+
+### Problem
+
+MK-03, Arm erratum 3843237 (r18p0-r53p0): Mali mis-compiles an integer vector
+bitwise operation (including shifts) when an operand is a lane swizzle, a
+vector assembled lane by lane, or a constant composite. The vector operation
+is scalarised so the compiler never sees the problematic vector form.
+
+### Transformation
+
+The pass targets these vector operations:
+
+- `OpShiftLeftLogical`, `OpShiftRightLogical`, `OpShiftRightArithmetic`
+- `OpBitwiseOr`, `OpBitwiseXor`, `OpBitwiseAnd`
+- `OpNot`
+
+An instruction is a candidate when:
+
+- its result type is an integer vector with 1..16 lanes, and
+- `rewrite_all` is set, **or** at least one source operand is a _pattern
+  operand_. A pattern operand is an `OpVectorShuffle`,
+  `OpCompositeConstruct`, `OpCompositeInsert`, `OpConstantComposite`,
+  `OpSpecConstantComposite`, or an `OpSpecConstantOp` producing a shuffle or
+  insert. `OpCopyObject` and `OpBitcast` are looked through (up to eight
+  levels).
+
+A candidate is rewritten as:
+
+```text
+%lane0 = OpCompositeExtract %component %src0 0
+%lane1 = OpCompositeExtract %component %src1 0
+%r0    = OpBitwiseOr %component %lane0 %lane1
+...    (one scalar op per lane)
+%result = OpCompositeConstruct %vector %r0 %r1 ...
+```
+
+For `OpNot` only one source is extracted per lane.
+
+### Preconditions and limits
+
+- Every source must be an integer vector with the same lane count and component
+  width as the result. A mismatch leaves the instruction untouched.
+- Scalar operations are never rewritten, even with `rewrite_all`.
+- At most 16 lanes are considered.
+- The pass does not try to fold or simplify the scalar results; it only changes
+  the representation.
+
+### Design notes
+
+All source types are validated before any instruction is created, so a failed
+rewrite does not leave partially built instructions behind. The final rewrite
+uses `IRContext::UpdateDefUse` (not `AnalyzeInstDefUse`) so the uses of the old
+vector operands are removed from the def-use manager.
+
+---
+
+## MaliClampZeroPass
+
+### Problem
+
+MK-32, Arm erratum 3779215 (r38p1-r49p0 and r50p0-r51p0; fixed in r49p1 and
+r52p0): Mali mis-compiles a min/max/clamp whose limit is a constant zero when
+the clamped value is selected at run time from compile-time constants. The
+clamp can degrade into a plain min or max.
+
+### Transformation
+
+The pass inspects `OpExtInst` instructions from `GLSL.std.450`:
+
+- Clamp: `FClamp`, `UClamp`, `SClamp`, `NClamp`
+- Min/max: `FMin`, `UMin`, `SMin`, `FMax`, `UMax`, `SMax`, `NMin`, `NMax`
+
+For a clamp, at least one limit must be a constant zero. For a min/max, exactly
+one operand must be a constant zero (otherwise the instruction is not
+rewritable or has no zero limit). Unless `rewrite_all` is set, the non-zero
+value must also be _constant-selected_: it must be provably built from
+compile-time constants.
+
+The constant-zero operand is replaced with an **opaque zero**:
+
+- Default mode: a `Private` variable is created per scalar type. A zero is
+  stored to it at the top of every entry point, and a load is inserted at the
+  top of each function that needs it. Vector zeros are built with
+  `OpCompositeConstruct` from the opaque scalar zero. The load defeats
+  constant propagation while remaining zero by construction (and Private
+  variables are zero-initialized anyway).
+- `bitfield_insert` mode (32-bit types): the zero is synthesized with
+  `OpBitFieldInsert` instead of a memory round trip. Integer zeros use the zero
+  constant as both `Base` and `Insert` with offset/count zero; float zeros are
+  bitcast to `uint`, passed through `OpBitFieldInsert`, and bitcast back.
+
+`rewrite_all` skips the constant-selected proof and rewrites every matching
+zero limit.
+
+### Constant-selected analysis
+
+`IsConstantSelected` follows values through:
+
+- `OpSelect` (both value operands)
+- `OpPhi` (all incoming values)
+- `OpLoad` (through `OpAccessChain`, `OpInBoundsAccessChain`,
+  `OpPtrAccessChain`, `OpInBoundsPtrAccessChain`, and `OpCopyObject` to the
+  root variable; all stores to that variable must themselves be
+  constant-selected)
+- `OpCompositeExtract`, `OpVectorShuffle`, `OpCompositeInsert`
+- `OpExtInst` and ordinary arithmetic/logical value instructions
+
+Root variables are limited to `Function`, `Private`, and `Output` storage.
+A variable written by `OpCopyMemory`/`OpCopyMemorySized` is rejected
+conservatively, because the copy can write through a pointer the analysis did
+not trace.
+
+### Preconditions and limits
+
+- Only `GLSL.std.450` is recognized.
+- A "constant zero" is `OpConstant` with all literal words zero,
+  `OpConstantNull`, or a composite of constant zeros. `-0.0` is not treated as
+  zero (it is not bitwise zero).
+- 64-bit float/integer `bitfield_insert` zeros fall back to the Private-variable
+  path.
+- The pass needs at least one entry point to seed the Private variable; without
+  one the variable is still zero-initialized, so the load remains semantically
+  correct.
+- The pass clears its caches at the start of `Process()`, so one pass object can
+  be run again on a different module.
+
+### Design notes
+
+The caches are keyed by `(function result id, type id)` because each function
+needs its own load. A single `Private` variable and store are shared across the
+module for a given scalar type. The pass updates def-use information with
+`IRContext::UpdateDefUse` when it replaces an operand.
+
+---
+
+## MaliPerVertexBlockPass
+
+### Problem
+
+Mali r44p1 (fixed in r47p0) crashes inside its compiler on
+geometry/tessellation pipelines whose per-vertex built-ins are loose
+variables instead of members of a `gl_PerVertex` block. glslang always emits
+the block; Zink emits loose variables.
+
+### Transformation
+
+The pass runs only when the module has exactly one entry point and its execution
+model is `Geometry`, `TessellationControl`, or `TessellationEvaluation`.
+
+For the `Input` and `Output` storage classes separately:
+
+1. Collect loose variables decorated `BuiltIn` with one of `Position`,
+   `PointSize`, `ClipDistance`, or `CullDistance`.
+2. Validate that every direct use is rewritable:
+    - `OpAccessChain` / `OpInBoundsAccessChain` with the variable as the base
+      (and, for arrayed interfaces, at least one index into the outer array);
+    - `OpLoad` / `OpStore` of the whole variable for non-arrayed interfaces;
+    - `OpEntryPoint`, `OpDecorate`, or `OpName`.
+      Any other use (for example `OpCopyObject`, `OpPtrAccessChain`, or
+      `OpCopyMemory`) makes the pass leave the module unchanged.
+3. Build one `OpTypeStruct` whose members are the built-in types, add
+   `OpMemberDecorate ... BuiltIn <builtin>` (and `Invariant` when present), and
+   decorate the struct type with `Block`.
+4. For arrayed interfaces (inputs, and tessellation-control outputs), build an
+   `OpTypeArray` of the new struct using the original outer array length. All
+   members must share that length.
+5. Add a new `OpVariable` for the block, redirect access chains to the block
+   base with the member index inserted (after the array index when arrayed),
+   and redirect whole loads/stores through a new member access chain.
+6. Replace the old variables in the entry point interface with the block
+   variable, remove their names/decorations, and delete the variables.
+
+### Preconditions and limits
+
+- At most eight loose built-ins per interface.
+- Unexpected decorations on a folded built-in (anything other than `BuiltIn`
+  and `Invariant`) make the pass bail out. Ordinary interface variables
+  decorated with `Location` and similar are ignored, not treated as errors.
+- The pass does not rewrite `OpPtrAccessChain`, pointer copies, or whole-array
+  loads/stores. Those cases are detected before any module change.
+- Member offsets are not emitted. Interface blocks do not require them for the
+  Input/Output storage classes used here, and omitting them avoids imposing
+  std140/std430 layout rules on per-vertex built-ins.
+- The pass is idempotent: after a successful run there are no loose per-vertex
+  built-ins left to collect.
+
+### Design notes
+
+All validation (decorations, use set, array lengths, pointer/array types) is
+done before types and variables are created. Internal type-manager failures
+return `Status::Failure` rather than leaving a partially modified module.
+`IRContext::KillNamesAndDecorates` removes `OpName` and `OpDecorate` before
+`KillInst`, which keeps debug names from dangling.
+
+---
+
+## MaliLockstepPass
+
+### Problem
+
+Compute shaders written for a 32-lane wave often use a strided loop
+
+```text
+for (i = gl_LocalInvocationID.x; i <= n; i += W) { ... Workgroup access ... }
+```
+
+where `W` is the workgroup X size. Different invocations can take different
+numbers of iterations, so a workgroup barrier cannot be placed inside the loop.
+Mali needs every invocation in the workgroup to execute the same trip count.
+
+### Transformation
+
+The pass requires:
+
+- exactly one `GLCompute` entry point;
+- an `OpExecutionMode ... LocalSize` with X size at least 2;
+- a `LocalInvocationId` built-in variable, and its `.x` obtained as lane 0 of a
+  load (a conversion of that value is also accepted for widened inductions);
+- a loop header with an `OpPhi` whose pre-loop incoming value is that
+  `LocalInvocationId.x` (or a conversion of it) and whose back-edge incoming is
+  `OpIAdd(phi, W)` where `W` is the constant LocalSize X;
+- a single exit block reached by a conditional branch on
+  `OpULessThanEqual(n, phi)` or `OpUGreaterThanEqual(phi, n)`, with `n` defined
+  in a block that dominates the header;
+- at least one Workgroup memory access in the loop (load/store, atomics, or
+  copy memory, including accesses through pointers derived by access chains).
+
+It then adds a second induction variable in the header:
+
+```text
+%b = OpPhi %type %zero %preheader %new_add %back_edge
+%new_add = OpIAdd %type %b %W
+```
+
+and builds a fresh comparison
+
+```text
+%cond2 = OpULessThanEqual %bool %n %b        (or the mirrored >= form)
+```
+
+which is used by the exit branch. The original comparison is left intact for
+any other users. The original per-thread induction variable still drives the
+loop body; only the trip-count test becomes workgroup-uniform.
+
+### Preconditions and limits
+
+- Structured control flow is assumed. Loop membership is computed with the
+  dominator analysis: a block is in the loop when the header dominates it and
+  the merge block does not.
+- One exit block and one conditional exit are required. `OpSwitch` exits,
+  multiple exits, and direct branches to the merge block cause the pass to
+  skip the loop.
+- Only unsigned comparisons are recognized.
+- The stride must be a non-specialization `OpConstant` equal to LocalSize X.
+  A 64-bit induction is supported, including its `OpUConvert` initial value and
+  two-word constants.
+- `LocalSizeId` is not handled; only the literal `LocalSize` execution mode is.
+- The transformation intentionally makes some invocations execute extra
+  iterations. It is only safe for loop bodies that are already guarded so that
+  extra iterations do not write out of range; this is the same assumption the
+  workaround has always made.
+
+### Design notes
+
+The new phi uses a zero constant created with the exact induction type and
+width (not `GetUIntConstId`, which is always 32-bit). The increment is inserted
+next to the original `OpIAdd` and then re-pointed at the new phi; this keeps the
+def-use manager consistent at every step. The fresh comparison is inserted
+before any `OpSelectionMerge`/`OpLoopMerge` (and before intervening debug line
+instructions) so the structured-control-flow rules keep holding.
+
+---
+
+## LowerClipCullDistancePass
+
+### Problem
+
+Some Mali drivers do not implement the `ClipDistance`/`CullDistance`
+built-ins. The pass emulates them with explicit distance checks against the
+`Position` built-in.
+
+### Transformation
+
+For each entry point, the pass finds the clip/cull distance variables and the
+position variable, finds stores to the distance outputs, and injects code that
+clips (or culls) the primitive when a distance becomes negative. The distance
+variables and their decorations are then removed, along with now-dead stores.
+
+### Preconditions and limits
+
+- Requires the `Shader` capability.
+- Does not support the `VariablePointers` or
+  `VariablePointersStorageBuffer` capabilities; it returns `Status::Failure`
+  for those modules.
+- Missing `Position` is handled by the pass's existing diagnostics and cleanup
+  path.
+- Supported execution models are the graphics stages listed in
+  `remove_clip_cull_dist_pass.cpp`; other stages are left alone.
+
+### Design notes
+
+This is the oldest Mali pass in the tree and is documented here for
+completeness. Unlike the other passes it can add blocks and branches, so it is
+run last by the compatibility layer.
+
+---
+
 NEWS 2023-01-11: Development occurs on the `main` branch.
 
 ## Overview
@@ -105,7 +528,7 @@ and in-progress work.
 
 *Note*: The validator checks some Universal Limits, from section 2.17 of the SPIR-V spec.
 The validator will fail on a module that exceeds those minimum upper bound limits.
-The validator has been parameterized to allow larger values, for use when targeting 
+The validator has been parameterized to allow larger values, for use when targeting
 a more-than-minimally-capable SPIR-V consumer.
 
 See [`tools/val/val.cpp`](tools/val/val.cpp) or run `spirv-val --help` for the command-line help.
@@ -311,7 +734,7 @@ Effcee itself depends on [RE2][re2], and RE2 depends on [Abseil][abseil-cpp].
 * If SPIRV-Tools is configured as part of a larger project that already uses
   Effcee, then that project should include Effcee before SPIRV-Tools.
 * Otherwise, SPIRV-Tools expects Effcee sources to appear in `external/effcee`,
-  RE2 sources to appear in `external/re2`, and Abseil sources to appear in 
+  RE2 sources to appear in `external/re2`, and Abseil sources to appear in
   `external/abseil_cpp`.
 
 #### Dependency on mimalloc
