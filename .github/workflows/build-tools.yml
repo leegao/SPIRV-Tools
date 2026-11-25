@@ -1,0 +1,48 @@
+name: Build and Package SPIRV-Tools
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build-and-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: '0'
+          persist-credentials: false
+
+      - name: Download dependencies
+        run: python3 utils/git-sync-deps
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSPIRV_BUILD_FUZZER=ON \
+            -DSPIRV_SKIP_TESTS=ON \
+            -DCMAKE_INSTALL_PREFIX=install
+
+      - name: Build and install
+        run: |
+          cmake --build build --parallel "$(nproc)"
+          cmake --install build
+
+      - name: Package tools
+        run: |
+          ls -lh install/bin
+          tar -C install/bin -cf - . | xz -9 -T0 > spirv-tools-linux-x86_64.tar.xz
+          ls -lh spirv-tools-linux-x86_64.tar.xz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: spirv-tools-linux-x86_64
+          path: spirv-tools-linux-x86_64.tar.xz
+          if-no-files-found: error
